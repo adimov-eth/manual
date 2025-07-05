@@ -1,36 +1,36 @@
-import type { ChatTx, Cmd, Frame, Replica } from './types';
-
-const execFrame = (prev: Frame, txs: ChatTx[]): Frame => ({
-  height: prev.height + 1,
-  txs
-});
+import type { Cmd, Replica } from './types';
 
 export const entityReduce = (rep: Replica, cmd: Cmd): Replica => {
   switch (cmd.t) {
     case 'ADD_TX':
       return { ...rep, mempool: [...rep.mempool, cmd.tx] };
 
-    case 'PROPOSE':
-      if (rep.waiting || rep.mempool.length === 0) return rep;
-      return {
-        ...rep,
-        waiting: true      // proposer starts waiting for ACKs
-      };
-
-    case 'ACK': {
-      // in this stripped version we assume everyone always ACKs instantly
-      return rep;         // real logic lives in server reducer
+    case 'PROPOSE': {
+      const pending = new Map(rep.pending);
+      pending.set(cmd.frame.height, cmd.frame);
+      const proposed = new Set(rep.proposed).add(cmd.frame.height);
+      return { ...rep, pending, proposed };
     }
 
-    case 'COMMIT':
-      return {
-        ...rep,
-        last:    cmd.frame,
-        waiting: false,
-        mempool: []
-      };
+    case 'VOTE': {
+      const acks = new Map(rep.acks);
+      const set = new Set(acks.get(cmd.h) ?? []).add(cmd.from);
+      acks.set(cmd.h, set);
+      return { ...rep, acks };
+    }
 
-    default:
-      return rep;
+    case 'COMMIT': {
+      const remaining = rep.mempool.filter(
+        tx => !cmd.frame.txs.some(t => t.id === tx.id)
+      );
+      const pending = new Map(rep.pending);
+      pending.delete(cmd.frame.height);
+      const acks = new Map(rep.acks);
+      acks.delete(cmd.frame.height);
+      return { ...rep, last: cmd.frame, mempool: remaining, pending, acks };
+    }
+
+    case 'IMPORT':
+      return cmd.replica;
   }
 };

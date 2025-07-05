@@ -1,111 +1,112 @@
-import { serverReduce, type ServerState } from './server';
-import type { ChatTx, Cmd, Envelope, Replica } from './types';
+import { v4 as uuid } from 'uuid';
+import { type ServerState, serverReduce } from './server';
+import type { ChatTx, Cmd, Frame, Replica } from './types';
 
+export const boot = (n = 5): Map<string, Replica> => {
+  const replicas = new Map<string, Replica>();
+  const genesis: Frame = { height: 0, txs: [] };
+  for (let i = 0; i < n; i++) {
+    const id = `0x0${i}` as const;
+    const key = `demo:${id}`;
+    replicas.set(key, {
+      roomId: 'demo',
+      id,
+      last: genesis,
+      mempool: [],
+      acks: new Map(),
+      pending: new Map(),
+      proposed: new Set()
+    });
+  }
+  return replicas;
+};
+
+
+export interface Envelope {
+  at: number;
+  key: string;
+  cmd: Cmd;
+}
 
 export interface World {
-  t:       number;                  // millis
-  state:   ServerState;             // replicas + their local state
-  queue:   Envelope[];              // pending network messages
+  t: number;
+  state: ServerState;
+  queue: Envelope[];
 }
 
-function partition<T>(
+const partition = <T>(
   arr: T[],
-  pred: (item: T) => boolean
-): [T[], T[]] {
-  const pass: T[] = [];
-  const fail: T[] = [];
-  for (const it of arr) {
-    if (pred(it)) pass.push(it);
-    else          fail.push(it);
-  }
-  return [pass, fail];
-}
-
-/** create five signer replicas for the same room */
-export const boot = (): Map<string, Replica> => {
-  const ids = Array.from({ length: 5 }, (_, i) => `0x0${i}` as const);
-  return new Map(ids.map(a => [
-    `demo:${a}`,
-    { roomId: 'demo', last: { height: 0, txs: [] }, mempool: [], waiting: false }
-  ]));
+  pred: (x: T) => boolean
+): [T[], T[]] => {
+  const left: T[]  = [];
+  const right: T[] = [];
+  for (const item of arr) (pred(item) ? left : right).push(item);
+  return [left, right];
 };
 
 export const step = (w: World, now: number): World => {
-  // ❶ deliver all messages whose time has come
   const [due, future] = partition(w.queue, e => e.at <= now);
-
   const { next, outbox } = serverReduce(
     w.state,
     due.map(e => ({ key: e.key, cmd: e.cmd }))
   );
-
-  // ❷ schedule freshly produced cmds with +latency
-  const latency = 30; // ms – tweak to simulate network
-  const scheduled: Envelope[] = outbox.map(e => ({
-    at:  now + latency,
-    ...e
-  }));
-
-  return {
-    t:     now,
-    state: next,
-    queue: future.concat(scheduled)
-  };
+  const lat = 20;
+  const scheduled = outbox.map(e => ({ at: now + lat, key: e.key, cmd: e.cmd }));
+  return { t: now, state: next, queue: future.concat(scheduled) };
 };
 
-let state = { replicas: boot() };
 
-export const tick = (inbox: [string, ChatTx][]) => {
-  // ❶ PREPARE an empty queue with the correct element type up front
-  const queued: { key: string; cmd: Cmd }[] = [];
+let world: World;
 
-  // ❷ GOSSIP each new ChatTx to every replica
-  for (const [, tx] of inbox) {
-    for (const key of state.replicas.keys()) {
-      queued.push({ key, cmd: { t: 'ADD_TX', tx } });
+export const resetWorld = (n = 5) => {
+  const now = 0;
+  world = { t: now, state: { replicas: boot(n) }, queue: [] };
+};
+
+resetWorld(); // initialise once on import
+// ────────────────────────────────────────────────────────────
+
+// util
+const idx = (id: string) => parseInt(id.slice(2), 16);
+const proposerFor = (h: number, n: number) => h % n;
+
+// internal scheduler
+const scheduleProposals = () => {
+  const total = world.state.replicas.size;
+  for (const [key, r] of world.state.replicas) {
+    const h = r.last.height + 1;
+    if (
+      proposerFor(h, total) === idx(r.id) &&
+      r.mempool.length &&
+      !r.proposed.has(h)
+    ) {
+      const frame = { height: h, txs: r.mempool };
+      world.queue.push({ at: world.t, key, cmd: { t: 'PROPOSE', frame } });
     }
   }
-
-  // ❸ Always let replica 0x00 propose in this toy model
-  queued.push({ key: 'demo:0x00', cmd: { t: 'PROPOSE' } });
-
-  const { next, outbox } = serverReduce(state, queued);
-  const { next: final }  = serverReduce(next, outbox);  // feedback loop
-
-  state = final;
-
-  const view = final.replicas.get('demo:0x00')!;
-  console.log(`Frame #${view.last.height}:`, view.last.txs.map(t => t.text));
 };
 
-
-
-const start = Date.now();
-let world: World = {
-  t:     start,
-  state: { replicas: boot() },
-  queue: []
-};
-
-export const sendTx = (tx: ChatTx) => {
+// PUBLIC: inject a chat message (gossip to every replica)
+export const broadcastTx = (text: string, from: string) => {
+  const tx: ChatTx = { id: uuid(), from: from as any, text };
   for (const key of world.state.replicas.keys()) {
-    world.queue.push({
-      at:  world.t,                // immediate delivery
-      key,
-      cmd: { t: "ADD_TX", tx }
-    });
+    world.queue.push({ at: world.t, key, cmd: { t: 'ADD_TX', tx } });
   }
 };
 
-export const loop = async () => {
-  while (true) {
-    const now = Date.now();
-    world = step(world, now);
-
-    // inspect one replica for demo
-    const view = world.state.replicas.get("demo:0x00")!;
-    console.log(`t=${now - start}ms | h=${view.last.height}`, view.last.txs);
-
-    await Bun.sleep(50);           // game‑loop cadence
-  }
+/**
+ * Advance the world by `tickDuration` ms,
+ * schedule any pending proposals, apply one step,
+ * and return the newly committed Frame for the default proposer (0x00).
+ */
+export const tick = (tickDuration = 1): Frame => {
+  world.t += tickDuration;
+  scheduleProposals();
+  world = step(world, world.t);
+  // return the last committed frame for replica "demo:0x00"
+  return world.state.replicas.get(`demo:0x00` as const)!.last;
 };
+
+// PUBLIC accessor used in tests
+export const getReplica = (addr = '0x00') =>
+  world.state.replicas.get(`demo:${addr}`)!;

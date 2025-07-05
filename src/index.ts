@@ -1,9 +1,19 @@
-import { v4 as uuid } from 'uuid';
-import { tick } from './runtime';
+// src/index.ts
+import { broadcastTx, tick } from './runtime';
 
-tick([]);                                  // genesis tick
+// Gossip two messages
+broadcastTx('first message',  '0x01');
+broadcastTx('second message', '0x02');
 
-tick([['0x01', { id: uuid(), from: '0x01', text: 'hello world' }]]);
-/* output ➜
-Frame #1: [ 'hello world' ]
-*/
+let seen = new Set<number>();
+
+// Every 50 ms, advance and log new frames
+const handle = setInterval(() => {
+  const frame = tick(50);
+  if (!seen.has(frame.height)) {
+    console.log(`Frame #${frame.height}:`, frame.txs.map(t => t.text));
+    seen.add(frame.height);
+  }
+  // stop once we hit height 1
+  if (frame.height >= 1) clearInterval(handle);
+}, 50);
