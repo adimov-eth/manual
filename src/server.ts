@@ -34,8 +34,16 @@ export const serverReduce = (
     replicas.set(key, updated);
 
     if (cmd.t === 'PROPOSE') {
-      for (const [k, r] of replicas)
-        out.push({ key: k, cmd: { t: 'VOTE', h: cmd.frame.height, from: r.id } });
+      const proposerKey = key;
+
+      // every signer sends one vote *to the proposer*
+      for (const [, r] of replicas)
+        out.push({
+          key: proposerKey,
+          cmd: { t: 'VOTE',
+                 h: cmd.frame.height,
+                 from: r.id }
+        });
       continue;
     }
 
