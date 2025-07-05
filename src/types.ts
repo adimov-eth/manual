@@ -30,3 +30,10 @@ export type Cmd =
   | { t: 'ACK';     frameH: string }
   | { t: 'COMMIT';  frame: Frame }
   | { t: 'IMPORT';  replica: Replica };
+
+
+  export interface Envelope {
+    at:  number;            // unix ms when this cmd should be delivered
+    key: string;            // replica id
+    cmd: Cmd;
+  }
